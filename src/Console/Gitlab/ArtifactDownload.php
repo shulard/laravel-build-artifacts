@@ -2,19 +2,33 @@
 
 namespace Shulard\BuildArtifacts\Console\Commands\Gitlab;
 
-use Illuminate\Console\Command;
+
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+// wraps env()
+function env() {
+    return call_user_func('getenv', func_get_arg(0)) ? : func_get_arg(1);
+}
+
+function base_path() {
+    return dirname(__DIR__);
+}
 
 class Download extends Command
 {
     /**
      * Gitlab API URL to project build collection
      */
-    const PROJECT_BUILD_URL = "%s/api/v3/projects/%d/builds?per_page=%d";
+    const PROJECT_BUILD_URL = "%s/api/v4/projects/%s/jobs?scope[]=success";
 
     /**
      * Gitlab API URL to download artifact for a given build
      */
-    const ARTIFACT_BUILD_URL = "%s/api/v3/projects/%d/builds/%d/artifacts";
+    const ARTIFACT_BUILD_URL = "%s/api/v4/projects/%s/artifacts/%d/artifacts/%s/download?job=%s";
 
     /**
      * The name and signature of the console command.
@@ -36,6 +50,41 @@ class Download extends Command
      * @var string
      */
     protected $description = 'Retrieve a Gitlab artifact and install it in the project';
+
+    protected function configure()
+    {
+        $this
+            ->setName('artifact:gitlab:download')
+            ->setDescription('Download artifacts from GitLab CI.')
+            ->addOption('token', null, InputOption::VALUE_REQUIRED, 'Gitlab authentication token')
+            ->addOption('project', null, InputOption::VALUE_REQUIRED, 'Project identifier on which artifact was built')
+            ->addOption('in', null, InputOption::VALUE_REQUIRED, 'Path where the artifact must be extracted', '.')
+            ->addOption('ref', null, InputOption::VALUE_REQUIRED, 'Repository ref the build was ran on')
+            ->addOption('tag', null, InputOption::VALUE_REQUIRED, 'Repository tag the build was ran on')
+            ->addOption('stage', null, InputOption::VALUE_REQUIRED, 'Build stage from which artifact is downloaded', 'prepare');
+    }
+
+    public function __construct($composer, $io) {
+        $this->composer = $composer;
+        $this->io = $io;
+        parent::__construct();
+    }
+
+    public function execute(InputInterface $input, OutputInterface $output)
+    {
+        $this->input = $input;
+        $this->output = $output;
+        $this->handle();
+    }
+
+    // wraps Symfony Console InputInterface::getOption()
+    public function option() {
+        return call_user_func_array([$this->input, 'getOption'], func_get_args());
+    }
+
+    public function comment($str) { $this->io->write('<comment>' . $str . '</comment>'); }
+    public function info($str) { $this->io->write('<info>' . $str . '</info>'); }
+    public function error($str) { $this->io->writeError($str); }
 
     /**
      * Execute the console command.
@@ -75,7 +124,7 @@ class Download extends Command
         try {
             $zip = fopen($path, 'w+');
             $this->api(
-                sprintf(self::ARTIFACT_BUILD_URL, $url, $project, $build['id']),
+                sprintf(self::ARTIFACT_BUILD_URL, $url, urlencode($project), $build['id']),
                 $token,
                 $zip
             );
@@ -100,7 +149,7 @@ class Download extends Command
     private function getLatestSuccessfulBuild($url, $token, $project, $stage, $ref, $tag)
     {
         $result = $this->apiJson(
-            sprintf(self::PROJECT_BUILD_URL, $url, $project, $this->option('perpage')),
+            sprintf(self::PROJECT_BUILD_URL, $url, urlencode($project)),
             $token
         );
 
