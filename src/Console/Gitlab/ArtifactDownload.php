@@ -2,19 +2,33 @@
 
 namespace Shulard\BuildArtifacts\Console\Commands\Gitlab;
 
-use Illuminate\Console\Command;
+
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+// wraps env()
+function env() {
+    return call_user_func('getenv', func_get_arg(0)) ? : func_get_arg(1);
+}
+
+function base_path() {
+    return dirname(__DIR__);
+}
 
 class Download extends Command
 {
     /**
      * Gitlab API URL to project build collection
      */
-    const PROJECT_BUILD_URL = "%s/api/v3/projects/%d/builds?per_page=%d";
+    const PROJECT_BUILD_URL = "%s/api/v4/projects/%s/jobs?scope[]=success";
 
     /**
      * Gitlab API URL to download artifact for a given build
      */
-    const ARTIFACT_BUILD_URL = "%s/api/v3/projects/%d/builds/%d/artifacts";
+    const ARTIFACT_BUILD_URL = "%s/api/v4/projects/%s/jobs/%d/artifacts";
 
     /**
      * The name and signature of the console command.
@@ -37,6 +51,43 @@ class Download extends Command
      */
     protected $description = 'Retrieve a Gitlab artifact and install it in the project';
 
+    protected function configure()
+    {
+        $this
+            ->setName('artifact:gitlab:download')
+            ->setDescription('Download artifacts from GitLab CI.')
+            ->addOption('token', null, InputOption::VALUE_REQUIRED, 'Gitlab authentication token')
+            ->addOption('project', null, InputOption::VALUE_REQUIRED, 'Project identifier on which artifact was built')
+            ->addOption('in', null, InputOption::VALUE_REQUIRED, 'Path where the artifact must be extracted', '.')
+            ->addOption('ref', null, InputOption::VALUE_REQUIRED, 'Repository ref the build was ran on')
+            ->addOption('tag', null, InputOption::VALUE_REQUIRED, 'Repository tag the build was ran on')
+            ->addOption('stage', null, InputOption::VALUE_REQUIRED, 'Build stage from which artifact is downloaded')
+            ->addOption('name', null, InputOption::VALUE_REQUIRED, 'Job name from which artifact', 'prepare')
+            ->addOption('preserve-temp-files', null, InputOption::VALUE_NONE, 'Whether to preserve downloaded tarball');
+    }
+
+    public function __construct($composer, $io) {
+        $this->composer = $composer;
+        $this->io = $io;
+        parent::__construct();
+    }
+
+    public function execute(InputInterface $input, OutputInterface $output)
+    {
+        $this->input = $input;
+        $this->output = $output;
+        $this->handle();
+    }
+
+    // wraps Symfony Console InputInterface::getOption()
+    public function option() {
+        return call_user_func_array([$this->input, 'getOption'], func_get_args());
+    }
+
+    public function comment($str) { $this->io->write('<comment>' . $str . '</comment>'); }
+    public function info($str) { $this->io->write('<info>' . $str . '</info>'); }
+    public function error($str) { $this->io->writeError($str); }
+
     /**
      * Execute the console command.
      *
@@ -53,6 +104,9 @@ class Download extends Command
         if (null === $token = $this->option('token')) {
             $token = env('GITLAB_TOKEN');
         }
+        if (!$this->option('name') && !$this->option('stage')) {
+            throw new \RuntimeException('At least one of --name or --stage must be supplied.');
+        }
 
         $in = realpath($this->option('in'));
         if (!is_dir($in) || !is_writable($in)) {
@@ -67,26 +121,35 @@ class Download extends Command
             $token,
             $project,
             $this->option('stage'),
+            $this->option('name'),
             $this->option('ref'),
             $this->option('tag')
         );
 
         $path = base_path().'/storage/artifact-'.$build['id'].'.zip';
         try {
-            $zip = fopen($path, 'w+');
+            if (! is_dir(base_path().'/storage')) {
+                mkdir(base_path().'/storage', 0700);
+            }
+            $zip = fopen($path, 'wb');
             $this->api(
-                sprintf(self::ARTIFACT_BUILD_URL, $url, $project, $build['id']),
+                sprintf(self::ARTIFACT_BUILD_URL, $url, urlencode($project), $build['id']),
                 $token,
                 $zip
             );
             fclose($zip);
         } catch (\Exception $error) {
             $this->error('Can\'t download artifact to '.$path);
+            $this->error($error->getMessage());
             fclose($zip);
+            return;
         }
+        $this->info(sprintf("Downloaded artifacts tarball at %s (%d bytes)", $path, filesize($path)));
 
         $this->installArtifact($path, $in);
-        unlink($path);
+        if (! $this->option('preserve-temp-files')) {
+            unlink($path);
+        }
     }
 
     /**
@@ -97,28 +160,30 @@ class Download extends Command
      * @return array
      * @throws \RuntimeException
      */
-    private function getLatestSuccessfulBuild($url, $token, $project, $stage, $ref, $tag)
+    private function getLatestSuccessfulBuild($url, $token, $project, $stage, $name, $ref, $tag)
     {
         $result = $this->apiJson(
-            sprintf(self::PROJECT_BUILD_URL, $url, $project, $this->option('perpage')),
+            sprintf(self::PROJECT_BUILD_URL, $url, urlencode($project)),
             $token
         );
-
-        $result = collect($result)->reject(function ($item) use ($stage, $ref, $tag) {
-            return $item['status'] !== 'success'
-                || $item['stage'] !== $stage
-                || (null !== $ref && $item['ref'] !== $ref)
-                || (null !== $tag && $item['tag'] !== $tag);
-        })->first();
-        if (null === $result) {
+        $result = array_filter($result, function ($item) use ($stage, $name, $ref, $tag) {
+            return $item['status'] === 'success'
+                                   && (!$stage || $item['stage'] === $stage)
+                                   && (!$name || $item['name'] === $name)
+                                   && (!$ref || $item['ref'] === $ref)
+                                   && (!$tag || $item['tag'] === $tag);
+        });
+        $result = reset($result);
+        if (!$result) {
             throw new \RuntimeException('Can\'t find a successful build in the project...');
         }
 
         $this->info(sprintf(
-            "Latest build [%s]\n- ref: %s\n- stage: %s\n- at: %s\n- runner: %d -> %s\n- triggered by: %s",
+            "Latest build [%s]\n- ref: %s\n- stage: %s\n- name: %s\n- at: %s\n- runner: %d -> %s\n- triggered by: %s",
             $result['id'],
             $result['ref'],
             $result['stage'],
+            $result['name'],
             $result['created_at'],
             $result['runner']['id'],
             $result['runner']['description'],
@@ -145,6 +210,7 @@ class Download extends Command
             curl_setopt($h, CURLOPT_FILE, $file);
         }
         curl_setopt($h, CURLOPT_URL, $url);
+        curl_setopt($h, CURLOPT_FOLLOWLOCATION, TRUE);
         curl_setopt($h, CURLOPT_HTTPHEADER, [
             sprintf("PRIVATE-TOKEN: %s", $token)
         ]);
